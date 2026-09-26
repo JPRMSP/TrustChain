@@ -6,11 +6,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.exceptions import InvalidSignature
 from datetime import datetime, timedelta, timezone
 import hashlib
-import pandas as pd
 
 
 # ============================================================
-# TRUSTCHAIN - PKI LAB
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -24,42 +23,36 @@ st.set_page_config(
 # SESSION STATE
 # ============================================================
 
-if "root_key" not in st.session_state:
-    st.session_state.root_key = None
+defaults = {
+    "root_key": None,
+    "root_cert": None,
+    "intermediate_key": None,
+    "intermediate_cert": None,
+    "certificates": {},
+    "revoked": set(),
+    "signature": None,
+    "signed_message": ""
+}
 
-if "root_cert" not in st.session_state:
-    st.session_state.root_cert = None
-
-if "intermediate_key" not in st.session_state:
-    st.session_state.intermediate_key = None
-
-if "intermediate_cert" not in st.session_state:
-    st.session_state.intermediate_cert = None
-
-if "certificates" not in st.session_state:
-    st.session_state.certificates = {}
-
-if "revoked" not in st.session_state:
-    st.session_state.revoked = set()
-
-if "signature" not in st.session_state:
-    st.session_state.signature = None
-
-if "signed_message" not in st.session_state:
-    st.session_state.signed_message = ""
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
-# UTILITY FUNCTIONS
+# BASIC FUNCTIONS
 # ============================================================
 
-def utc_now():
+def now_utc():
     return datetime.now(timezone.utc)
 
 
-def generate_key(algorithm="RSA"):
+def generate_key(algorithm):
+
     if algorithm == "ECC":
-        return ec.generate_private_key(ec.SECP256R1())
+        return ec.generate_private_key(
+            ec.SECP256R1()
+        )
 
     return rsa.generate_private_key(
         public_exponent=65537,
@@ -67,40 +60,33 @@ def generate_key(algorithm="RSA"):
     )
 
 
-def key_algorithm(key):
+def algorithm_name(key):
+
     if isinstance(key, rsa.RSAPrivateKey):
         return "RSA-2048"
 
     if isinstance(key, ec.EllipticCurvePrivateKey):
-        return f"ECC-{key.curve.name}"
+        return "ECC / SECP256R1"
 
     return "Unknown"
 
 
-def serialize_private_key(key):
-    return key.private_bytes(
-        Encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode()
+def certificate_pem(cert):
 
-
-def serialize_certificate(cert):
     return cert.public_bytes(
         serialization.Encoding.PEM
-    ).decode()
+    ).decode("utf-8")
 
 
 def fingerprint(cert):
+
     return cert.fingerprint(
         hashes.SHA256()
     ).hex(":").upper()
 
 
-def create_name(
-    common_name,
-    organization="TrustChain PKI Lab"
-):
+def create_name(common_name):
+
     return x509.Name([
         x509.NameAttribute(
             NameOID.COUNTRY_NAME,
@@ -108,7 +94,7 @@ def create_name(
         ),
         x509.NameAttribute(
             NameOID.ORGANIZATION_NAME,
-            organization
+            "TrustChain"
         ),
         x509.NameAttribute(
             NameOID.COMMON_NAME,
@@ -118,15 +104,13 @@ def create_name(
 
 
 # ============================================================
-# DIGITAL SIGNATURE FUNCTIONS
+# KEY SIGNING
 # ============================================================
 
 def sign_data(private_key, data):
 
-    if isinstance(
-        private_key,
-        rsa.RSAPrivateKey
-    ):
+    if isinstance(private_key, rsa.RSAPrivateKey):
+
         return private_key.sign(
             data,
             padding.PKCS1v15(),
@@ -139,18 +123,11 @@ def sign_data(private_key, data):
     )
 
 
-def verify_data(
-    public_key,
-    data,
-    signature
-):
+def verify_data(public_key, data, signature):
 
     try:
 
-        if isinstance(
-            public_key,
-            rsa.RSAPublicKey
-        ):
+        if isinstance(public_key, rsa.RSAPublicKey):
 
             public_key.verify(
                 signature,
@@ -169,31 +146,24 @@ def verify_data(
 
         return True
 
-    except InvalidSignature:
-
-        return False
-
     except Exception:
 
         return False
 
 
 # ============================================================
-# ROOT CA
+# ROOT CA CREATION
 # ============================================================
 
-def create_root_ca(
-    common_name,
-    algorithm
-):
+def create_root_ca(common_name, algorithm):
 
     key = generate_key(algorithm)
 
     name = create_name(common_name)
 
-    now = utc_now()
+    current = now_utc()
 
-    certificate = (
+    cert = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
@@ -202,10 +172,10 @@ def create_root_ca(
             x509.random_serial_number()
         )
         .not_valid_before(
-            now - timedelta(minutes=1)
+            current - timedelta(minutes=1)
         )
         .not_valid_after(
-            now + timedelta(days=3650)
+            current + timedelta(days=3650)
         )
         .add_extension(
             x509.BasicConstraints(
@@ -234,7 +204,7 @@ def create_root_ca(
         )
     )
 
-    return key, certificate
+    return key, cert
 
 
 # ============================================================
@@ -250,21 +220,23 @@ def create_intermediate_ca(
 
     key = generate_key(algorithm)
 
-    subject = create_name(common_name)
+    name = create_name(common_name)
 
-    certificate = (
+    current = now_utc()
+
+    cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
+        .subject_name(name)
         .issuer_name(root_cert.subject)
         .public_key(key.public_key())
         .serial_number(
             x509.random_serial_number()
         )
         .not_valid_before(
-            utc_now() - timedelta(minutes=1)
+            current - timedelta(minutes=1)
         )
         .not_valid_after(
-            utc_now() + timedelta(days=1825)
+            current + timedelta(days=1825)
         )
         .add_extension(
             x509.BasicConstraints(
@@ -293,14 +265,14 @@ def create_intermediate_ca(
         )
     )
 
-    return key, certificate
+    return key, cert
 
 
 # ============================================================
 # END ENTITY CERTIFICATE
 # ============================================================
 
-def issue_certificate(
+def create_user_certificate(
     issuer_key,
     issuer_cert,
     common_name,
@@ -309,21 +281,23 @@ def issue_certificate(
 
     key = generate_key(algorithm)
 
-    subject = create_name(common_name)
+    name = create_name(common_name)
 
-    certificate = (
+    current = now_utc()
+
+    cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
+        .subject_name(name)
         .issuer_name(issuer_cert.subject)
         .public_key(key.public_key())
         .serial_number(
             x509.random_serial_number()
         )
         .not_valid_before(
-            utc_now() - timedelta(minutes=1)
+            current - timedelta(minutes=1)
         )
         .not_valid_after(
-            utc_now() + timedelta(days=365)
+            current + timedelta(days=365)
         )
         .add_extension(
             x509.BasicConstraints(
@@ -365,43 +339,38 @@ def issue_certificate(
         )
     )
 
-    return key, certificate
+    return key, cert
 
 
 # ============================================================
-# CERTIFICATE VERIFICATION
+# CERTIFICATE SIGNATURE VERIFICATION
 # ============================================================
 
-def verify_certificate_signature(
-    certificate,
-    issuer_certificate
-):
+def verify_certificate(cert, issuer_cert):
 
     try:
 
-        issuer_public_key = (
-            issuer_certificate.public_key()
-        )
+        public_key = issuer_cert.public_key()
 
         if isinstance(
-            issuer_public_key,
+            public_key,
             rsa.RSAPublicKey
         ):
 
-            issuer_public_key.verify(
-                certificate.signature,
-                certificate.tbs_certificate_bytes,
+            public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
                 padding.PKCS1v15(),
-                certificate.signature_hash_algorithm
+                cert.signature_hash_algorithm
             )
 
         else:
 
-            issuer_public_key.verify(
-                certificate.signature,
-                certificate.tbs_certificate_bytes,
+            public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
                 ec.ECDSA(
-                    certificate.signature_hash_algorithm
+                    cert.signature_hash_algorithm
                 )
             )
 
@@ -412,44 +381,59 @@ def verify_certificate_signature(
         return False
 
 
-def certificate_status(
-    certificate,
-    issuer_certificate,
+# ============================================================
+# CERTIFICATE STATUS
+# ============================================================
+
+def check_certificate(
+    cert,
+    issuer_cert,
     revoked
 ):
 
-    checks = {}
+    signature_ok = verify_certificate(
+        cert,
+        issuer_cert
+    )
 
-    checks["Signature"] = (
-        verify_certificate_signature(
-            certificate,
-            issuer_certificate
+    current = now_utc()
+
+    try:
+        valid_time = (
+            cert.not_valid_before_utc
+            <= current
+            <= cert.not_valid_after_utc
         )
+    except AttributeError:
+
+        valid_time = (
+            cert.not_valid_before
+            <= current.replace(tzinfo=None)
+            <= cert.not_valid_after
+        )
+
+    issuer_ok = (
+        cert.issuer == issuer_cert.subject
     )
 
-    now = utc_now()
-
-    checks["Validity"] = (
-        certificate.not_valid_before_utc
-        <= now
-        <= certificate.not_valid_after_utc
+    revocation_ok = (
+        cert.serial_number not in revoked
     )
 
-    checks["Revocation"] = (
-        certificate.serial_number
-        not in revoked
+    trusted = (
+        signature_ok
+        and valid_time
+        and issuer_ok
+        and revocation_ok
     )
 
-    checks["Issuer"] = (
-        certificate.issuer
-        == issuer_certificate.subject
-    )
-
-    checks["Trusted"] = all(
-        checks.values()
-    )
-
-    return checks
+    return {
+        "Signature": signature_ok,
+        "Validity": valid_time,
+        "Issuer": issuer_ok,
+        "Revocation": revocation_ok,
+        "Trusted": trusted
+    }
 
 
 # ============================================================
@@ -457,17 +441,15 @@ def certificate_status(
 # ============================================================
 
 st.title(
-    "🔐 TrustChain — Live PKI Laboratory"
+    "🔐 TrustChain — Real-Time PKI Laboratory"
 )
 
 st.markdown(
     """
-    A real-time Public Key Infrastructure laboratory
-    demonstrating:
+    **Interactive Public Key Infrastructure Laboratory**
 
-    **Certificate Authority → X.509 Certificate →
-    Trust Chain → Digital Signature → Verification →
-    Revocation**
+    Explore certificate authorities, X.509 certificates,
+    digital signatures, trust chains and certificate revocation.
     """
 )
 
@@ -478,170 +460,124 @@ st.divider()
 # TABS
 # ============================================================
 
-tabs = st.tabs([
-    "📊 Dashboard",
-    "🏛️ Certificate Authority",
-    "📜 Certificate Explorer",
-    "✍️ Digital Signature",
-    "🚫 Revocation Center",
-    "🔒 Secure Communication"
-])
+dashboard, ca_tab, explorer, signature_tab, revocation, secure = st.tabs(
+    [
+        "📊 Dashboard",
+        "🏛️ Certificate Authority",
+        "📜 Certificate Explorer",
+        "✍️ Digital Signature",
+        "🚫 Revocation",
+        "🔒 Secure Communication"
+    ]
+)
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-with tabs[0]:
+with dashboard:
 
-    st.header(
-        "PKI Trust Dashboard"
-    )
-
-    root_exists = (
-        st.session_state.root_cert
-        is not None
-    )
-
-    intermediate_exists = (
-        st.session_state.intermediate_cert
-        is not None
-    )
+    st.header("PKI Dashboard")
 
     col1, col2, col3, col4 = st.columns(4)
 
     col1.metric(
         "Root CA",
         "ACTIVE"
-        if root_exists
+        if st.session_state.root_cert
         else "NOT CREATED"
     )
 
     col2.metric(
         "Intermediate CA",
         "ACTIVE"
-        if intermediate_exists
+        if st.session_state.intermediate_cert
         else "NOT CREATED"
     )
 
     col3.metric(
         "Certificates",
-        len(
-            st.session_state.certificates
-        )
+        len(st.session_state.certificates)
     )
 
     col4.metric(
         "Revoked",
-        len(
-            st.session_state.revoked
-        )
+        len(st.session_state.revoked)
     )
 
     st.divider()
 
-    st.subheader(
-        "Trust Architecture"
+    st.subheader("PKI Trust Chain")
+
+    st.code(
+        """
+                 ROOT CA
+                    │
+                    │ signs
+                    ▼
+            INTERMEDIATE CA
+                    │
+             ┌──────┴──────┐
+             │             │
+             ▼             ▼
+          USER          SERVER
+       CERTIFICATE    CERTIFICATE
+             │
+             ▼
+       DIGITAL SIGNATURE
+             │
+             ▼
+       VERIFICATION
+             │
+       ┌─────┴─────┐
+       ▼           ▼
+     TRUSTED    REJECTED
+        """
     )
 
-    if root_exists:
+    st.subheader("Implemented PKI Components")
 
-        st.success(
-            "✓ Root CA is available"
-        )
+    components = [
+        "✓ RSA Asymmetric Cryptography",
+        "✓ ECC Cryptography",
+        "✓ X.509 Certificates",
+        "✓ Root Certificate Authority",
+        "✓ Intermediate Certificate Authority",
+        "✓ Certificate Chain",
+        "✓ Digital Signatures",
+        "✓ SHA-256",
+        "✓ Certificate Revocation",
+        "✓ Secure Communication"
+    ]
 
-        st.code(
-            """
-                    ┌──────────────────────┐
-                    │       ROOT CA        │
-                    │   TrustChain Root    │
-                    └──────────┬───────────┘
-                               │
-                               │ signs
-                               ▼
-                    ┌──────────────────────┐
-                    │   INTERMEDIATE CA    │
-                    │    TrustChain ICA    │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-                    ▼                     ▼
-              ┌───────────┐        ┌────────────┐
-              │   USER    │        │   SERVER   │
-              │Certificate│        │Certificate │
-              └───────────┘        └────────────┘
-            """
-        )
-
-    else:
-
-        st.warning(
-            "Create a Root CA from the Certificate Authority tab."
-        )
-
-    st.subheader(
-        "PKI Concepts Demonstrated"
-    )
-
-    concepts = pd.DataFrame({
-
-        "Concept": [
-
-            "Asymmetric Cryptography",
-            "X.509 Certificates",
-            "Certificate Authority",
-            "Certificate Chain",
-            "Digital Signature",
-            "Certificate Revocation",
-            "Key Lifecycle",
-            "Trust Model"
-
-        ],
-
-        "Status": [
-
-            "Implemented",
-            "Implemented",
-            "Implemented",
-            "Implemented",
-            "Implemented",
-            "Implemented",
-            "Implemented"
-
-        ]
-
-    })
-
-    st.dataframe(
-        concepts,
-        use_container_width=True
-    )
+    for component in components:
+        st.write(component)
 
 
 # ============================================================
 # CERTIFICATE AUTHORITY
 # ============================================================
 
-with tabs[1]:
+with ca_tab:
 
-    st.header(
-        "🏛️ Certificate Authority"
-    )
+    st.header("🏛️ Certificate Authority")
 
-    st.subheader(
-        "Step 1 — Create Root CA"
-    )
+    # --------------------------------------------------------
+    # ROOT CA
+    # --------------------------------------------------------
 
-    root_cn = st.text_input(
-        "Root CA Common Name",
-        value="TrustChain Root CA"
+    st.subheader("1. Generate Root CA")
+
+    root_name = st.text_input(
+        "Root CA Name",
+        "TrustChain Root CA"
     )
 
     root_algorithm = st.selectbox(
         "Root CA Algorithm",
         ["RSA", "ECC"],
-        key="root_algorithm"
+        key="root_algo"
     )
 
     if st.button(
@@ -649,165 +585,157 @@ with tabs[1]:
         type="primary"
     ):
 
-        with st.spinner(
-            "Generating cryptographic keys and certificate..."
-        ):
+        key, cert = create_root_ca(
+            root_name,
+            root_algorithm
+        )
 
-            key, certificate = (
-                create_root_ca(
-                    root_cn,
-                    root_algorithm
-                )
-            )
-
-            st.session_state.root_key = key
-            st.session_state.root_cert = certificate
+        st.session_state.root_key = key
+        st.session_state.root_cert = cert
 
         st.success(
-            "✓ Root CA generated successfully."
+            "✓ Root CA created successfully."
         )
 
     if st.session_state.root_cert:
 
-        certificate = (
-            st.session_state.root_cert
-        )
+        cert = st.session_state.root_cert
 
-        st.markdown(
-            "### Root CA Information"
-        )
+        st.success("Root CA ACTIVE")
 
-        c1, c2, c3 = st.columns(3)
+        col1, col2, col3 = st.columns(3)
 
-        c1.metric(
+        col1.metric(
             "Algorithm",
-            key_algorithm(
+            algorithm_name(
                 st.session_state.root_key
             )
         )
 
-        c2.metric(
-            "Certificate",
-            "X.509"
+        col2.metric(
+            "Type",
+            "Root CA"
         )
 
-        c3.metric(
+        col3.metric(
             "Validity",
             "10 Years"
         )
 
-        st.code(
-            serialize_certificate(
-                certificate
-            ),
-            language="text"
+        st.write(
+            "**Fingerprint:**",
+            fingerprint(cert)
         )
 
-        st.write(
-            "**SHA-256 Fingerprint:**",
-            fingerprint(certificate)
-        )
+        with st.expander(
+            "View Root CA Certificate"
+        ):
+
+            st.code(
+                certificate_pem(cert),
+                language="text"
+            )
 
     st.divider()
 
-    st.subheader(
-        "Step 2 — Create Intermediate CA"
-    )
+    # --------------------------------------------------------
+    # INTERMEDIATE CA
+    # --------------------------------------------------------
+
+    st.subheader("2. Generate Intermediate CA")
 
     if not st.session_state.root_cert:
 
         st.warning(
-            "Create the Root CA first."
+            "Generate the Root CA first."
         )
 
     else:
 
-        intermediate_cn = st.text_input(
-            "Intermediate CA Common Name",
-            value="TrustChain Intermediate CA"
+        intermediate_name = st.text_input(
+            "Intermediate CA Name",
+            "TrustChain Intermediate CA"
         )
 
         intermediate_algorithm = st.selectbox(
-            "Intermediate Algorithm",
+            "Intermediate CA Algorithm",
             ["RSA", "ECC"],
-            key="intermediate_algorithm"
+            key="intermediate_algo"
         )
 
         if st.button(
             "Generate Intermediate CA"
         ):
 
-            key, certificate = (
-                create_intermediate_ca(
-                    st.session_state.root_key,
-                    st.session_state.root_cert,
-                    intermediate_cn,
-                    intermediate_algorithm
-                )
+            key, cert = create_intermediate_ca(
+                st.session_state.root_key,
+                st.session_state.root_cert,
+                intermediate_name,
+                intermediate_algorithm
             )
 
             st.session_state.intermediate_key = key
-            st.session_state.intermediate_cert = certificate
+            st.session_state.intermediate_cert = cert
 
             st.success(
-                "✓ Intermediate CA signed by Root CA."
+                "✓ Intermediate CA created and signed by Root CA."
             )
 
     if st.session_state.intermediate_cert:
 
-        certificate = (
-            st.session_state.intermediate_cert
-        )
+        cert = st.session_state.intermediate_cert
 
-        st.markdown(
-            "### Intermediate CA Certificate"
+        st.success(
+            "Intermediate CA ACTIVE"
         )
 
         st.write(
             "**Issuer:**",
-            certificate.issuer.rfc4514_string()
+            cert.issuer.rfc4514_string()
         )
 
         st.write(
             "**Subject:**",
-            certificate.subject.rfc4514_string()
+            cert.subject.rfc4514_string()
+        )
+
+        st.write(
+            "**Algorithm:**",
+            algorithm_name(
+                st.session_state.intermediate_key
+            )
         )
 
         st.write(
             "**Fingerprint:**",
-            fingerprint(certificate)
-        )
-
-        st.code(
-            serialize_certificate(
-                certificate
-            ),
-            language="text"
+            fingerprint(cert)
         )
 
     st.divider()
 
-    st.subheader(
-        "Step 3 — Issue End-Entity Certificate"
-    )
+    # --------------------------------------------------------
+    # USER CERTIFICATE
+    # --------------------------------------------------------
+
+    st.subheader("3. Issue End-Entity Certificate")
 
     if not st.session_state.intermediate_cert:
 
         st.warning(
-            "Create an Intermediate CA first."
+            "Generate the Intermediate CA first."
         )
 
     else:
 
-        entity_cn = st.text_input(
+        user_name = st.text_input(
             "Certificate Common Name",
-            value="student.trustchain.local"
+            "student.trustchain.local"
         )
 
-        entity_algorithm = st.selectbox(
-            "End-Entity Algorithm",
+        user_algorithm = st.selectbox(
+            "Certificate Algorithm",
             ["RSA", "ECC"],
-            key="entity_algorithm"
+            key="user_algo"
         )
 
         if st.button(
@@ -815,73 +743,53 @@ with tabs[1]:
             type="primary"
         ):
 
-            key, certificate = (
-                issue_certificate(
-                    st.session_state.intermediate_key,
-                    st.session_state.intermediate_cert,
-                    entity_cn,
-                    entity_algorithm
-                )
+            key, cert = create_user_certificate(
+                st.session_state.intermediate_key,
+                st.session_state.intermediate_cert,
+                user_name,
+                user_algorithm
             )
 
             st.session_state.certificates[
-                entity_cn
+                user_name
             ] = {
-
                 "key": key,
-                "cert": certificate
-
+                "cert": cert
             }
 
             st.success(
-                f"✓ Certificate issued for {entity_cn}"
+                "✓ End-entity certificate issued."
             )
 
         if st.session_state.certificates:
 
-            rows = []
-
-            for name, item in (
-                st.session_state.certificates.items()
-            ):
-
-                certificate = item["cert"]
-
-                rows.append({
-
-                    "Subject": name,
-
-                    "Algorithm":
-                        key_algorithm(
-                            item["key"]
-                        ),
-
-                    "Serial":
-                        str(
-                            certificate.serial_number
-                        ),
-
-                    "Status":
-                        (
-                            "REVOKED"
-                            if certificate.serial_number
-                            in st.session_state.revoked
-                            else "VALID"
-                        )
-
-                })
-
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True
+            st.subheader(
+                "Issued Certificates"
             )
+
+            for name, item in st.session_state.certificates.items():
+
+                cert = item["cert"]
+
+                status = (
+                    "REVOKED"
+                    if cert.serial_number
+                    in st.session_state.revoked
+                    else "ACTIVE"
+                )
+
+                st.write(
+                    f"**{name}** — "
+                    f"{algorithm_name(item['key'])} — "
+                    f"{status}"
+                )
 
 
 # ============================================================
 # CERTIFICATE EXPLORER
 # ============================================================
 
-with tabs[2]:
+with explorer:
 
     st.header(
         "📜 X.509 Certificate Explorer"
@@ -890,7 +798,7 @@ with tabs[2]:
     if not st.session_state.certificates:
 
         st.info(
-            "Issue at least one certificate from the Certificate Authority tab."
+            "Issue an end-entity certificate first."
         )
 
     else:
@@ -901,7 +809,8 @@ with tabs[2]:
 
         selected = st.selectbox(
             "Select Certificate",
-            names
+            names,
+            key="explorer_cert"
         )
 
         item = (
@@ -910,88 +819,122 @@ with tabs[2]:
             ]
         )
 
-        certificate = item["cert"]
-
-        st.subheader(
-            "Certificate Details"
-        )
+        cert = item["cert"]
 
         col1, col2 = st.columns(2)
 
         with col1:
 
             st.write(
-                "**Subject**",
-                certificate.subject.rfc4514_string()
+                "**Subject**"
+            )
+
+            st.code(
+                cert.subject.rfc4514_string()
             )
 
             st.write(
-                "**Issuer**",
-                certificate.issuer.rfc4514_string()
+                "**Issuer**"
+            )
+
+            st.code(
+                cert.issuer.rfc4514_string()
             )
 
             st.write(
-                "**Serial Number**",
-                certificate.serial_number
+                "**Serial Number**"
             )
 
-            st.write(
-                "**Signature Algorithm**",
-                certificate.signature_algorithm_oid._name
+            st.code(
+                str(cert.serial_number)
             )
 
         with col2:
 
             st.write(
-                "**Valid From**",
-                certificate.not_valid_before_utc
+                "**Algorithm**"
+            )
+
+            st.code(
+                algorithm_name(item["key"])
             )
 
             st.write(
-                "**Valid Until**",
-                certificate.not_valid_after_utc
+                "**Signature Algorithm**"
+            )
+
+            st.code(
+                cert.signature_algorithm_oid._name
             )
 
             st.write(
-                "**Public Key**",
-                key_algorithm(
-                    item["key"]
-                )
+                "**SHA-256 Fingerprint**"
             )
 
-            st.write(
-                "**SHA-256 Fingerprint**",
-                fingerprint(certificate)
+            st.code(
+                fingerprint(cert)
             )
 
         st.divider()
 
-        issuer = (
-            st.session_state.intermediate_cert
+        st.subheader(
+            "Certificate Validity"
         )
 
-        checks = certificate_status(
-            certificate,
-            issuer,
+        try:
+
+            valid_from = (
+                cert.not_valid_before_utc
+            )
+
+            valid_until = (
+                cert.not_valid_after_utc
+            )
+
+        except AttributeError:
+
+            valid_from = (
+                cert.not_valid_before
+            )
+
+            valid_until = (
+                cert.not_valid_after
+            )
+
+        st.write(
+            "Valid From:",
+            valid_from
+        )
+
+        st.write(
+            "Valid Until:",
+            valid_until
+        )
+
+        st.divider()
+
+        st.subheader(
+            "Trust Validation"
+        )
+
+        checks = check_certificate(
+            cert,
+            st.session_state.intermediate_cert,
             st.session_state.revoked
         )
 
-        st.subheader(
-            "Certificate Validation"
-        )
-
-        for check, result in checks.items():
+        for name, result in checks.items():
 
             if result:
 
                 st.success(
-                    f"✓ {check}: PASS"
+                    "✓ " + name + ": PASS"
                 )
 
             else:
 
                 st.error(
-                    f"✗ {check}: FAIL"
+                    "✗ " + name + ": FAIL"
                 )
 
         if checks["Trusted"]:
@@ -1006,14 +949,14 @@ with tabs[2]:
                 "🚨 FINAL RESULT: CERTIFICATE NOT TRUSTED"
             )
 
+        st.divider()
+
         st.subheader(
             "PEM Certificate"
         )
 
         st.code(
-            serialize_certificate(
-                certificate
-            ),
+            certificate_pem(cert),
             language="text"
         )
 
@@ -1022,7 +965,7 @@ with tabs[2]:
 # DIGITAL SIGNATURE
 # ============================================================
 
-with tabs[3]:
+with signature_tab:
 
     st.header(
         "✍️ Digital Signature Laboratory"
@@ -1031,31 +974,30 @@ with tabs[3]:
     if not st.session_state.certificates:
 
         st.warning(
-            "Create an end-entity certificate first."
+            "Create a certificate first."
         )
 
     else:
 
-        selected = st.selectbox(
+        names = list(
+            st.session_state.certificates.keys()
+        )
+
+        signer = st.selectbox(
             "Signing Certificate",
-            list(
-                st.session_state.certificates.keys()
-            ),
-            key="signer"
+            names,
+            key="signature_cert"
         )
 
         item = (
             st.session_state.certificates[
-                selected
+                signer
             ]
         )
 
         message = st.text_area(
-            "Message to Sign",
-            value=(
-                "I authorize this secure transaction "
-                "through TrustChain PKI."
-            )
+            "Message",
+            "I authorize this secure transaction."
         )
 
         if st.button(
@@ -1065,10 +1007,11 @@ with tabs[3]:
 
             signature = sign_data(
                 item["key"],
-                message.encode()
+                message.encode("utf-8")
             )
 
             st.session_state.signature = signature
+
             st.session_state.signed_message = message
 
             st.success(
@@ -1078,7 +1021,7 @@ with tabs[3]:
         if st.session_state.signature:
 
             st.subheader(
-                "Signature"
+                "Generated Signature"
             )
 
             st.code(
@@ -1086,7 +1029,7 @@ with tabs[3]:
             )
 
             st.write(
-                "Signature length:",
+                "Signature size:",
                 len(
                     st.session_state.signature
                 ),
@@ -1100,47 +1043,44 @@ with tabs[3]:
             )
 
             verification_message = st.text_area(
-                "Message for Verification",
-                value=(
-                    st.session_state.signed_message
-                ),
-                key="verification_message"
+                "Message to Verify",
+                st.session_state.signed_message,
+                key="verify_message"
             )
 
             if st.button(
-                "Verify Digital Signature"
+                "Verify Signature"
             ):
 
-                valid = verify_data(
+                result = verify_data(
                     item["key"].public_key(),
-                    verification_message.encode(),
+                    verification_message.encode("utf-8"),
                     st.session_state.signature
                 )
 
-                if valid:
+                if result:
 
                     st.success(
-                        "✓ DIGITAL SIGNATURE VALID — "
-                        "Message is authentic and unchanged."
+                        "✓ SIGNATURE VALID"
                     )
 
                 else:
 
                     st.error(
-                        "✗ DIGITAL SIGNATURE INVALID — "
-                        "Message was modified or signature is invalid."
+                        "✗ SIGNATURE INVALID"
                     )
 
             st.info(
-                "Demo: change even one character in the message and verify again."
+                "Try changing ₹5000 to ₹9000 or modify one character. "
+                "The signature verification will fail."
             )
 
 
 # ============================================================
-# REVOCATION CENTER
+# REVOCATION
 # ============================================================
 
-with tabs[4]:
+with revocation:
 
     st.header(
         "🚫 Certificate Revocation Center"
@@ -1149,19 +1089,19 @@ with tabs[4]:
     if not st.session_state.certificates:
 
         st.info(
-            "No certificates have been issued."
+            "No certificates available."
         )
 
     else:
 
-        certificate_names = list(
+        names = list(
             st.session_state.certificates.keys()
         )
 
         selected = st.selectbox(
-            "Select certificate",
-            certificate_names,
-            key="revoke_certificate"
+            "Certificate",
+            names,
+            key="revocation_cert"
         )
 
         item = (
@@ -1170,27 +1110,25 @@ with tabs[4]:
             ]
         )
 
-        certificate = item["cert"]
+        cert = item["cert"]
 
-        if (
-            certificate.serial_number
+        revoked = (
+            cert.serial_number
             in st.session_state.revoked
-        ):
+        )
+
+        if revoked:
 
             st.error(
-                "Certificate is currently REVOKED."
+                "🚨 CERTIFICATE REVOKED"
             )
 
             if st.button(
-                "Restore Certificate For Demo"
+                "Restore Certificate"
             ):
 
                 st.session_state.revoked.remove(
-                    certificate.serial_number
-                )
-
-                st.success(
-                    "Certificate restored for demonstration."
+                    cert.serial_number
                 )
 
                 st.rerun()
@@ -1198,7 +1136,7 @@ with tabs[4]:
         else:
 
             st.success(
-                "Certificate is currently ACTIVE."
+                "✓ CERTIFICATE ACTIVE"
             )
 
             if st.button(
@@ -1207,11 +1145,7 @@ with tabs[4]:
             ):
 
                 st.session_state.revoked.add(
-                    certificate.serial_number
-                )
-
-                st.error(
-                    "Certificate has been revoked."
+                    cert.serial_number
                 )
 
                 st.rerun()
@@ -1219,58 +1153,28 @@ with tabs[4]:
         st.divider()
 
         st.subheader(
-            "Certificate Status"
-        )
-
-        st.write(
-            "**Subject:**",
-            certificate.subject.rfc4514_string()
-        )
-
-        st.write(
-            "**Serial:**",
-            certificate.serial_number
-        )
-
-        st.write(
-            "**SHA-256:**",
-            fingerprint(certificate)
-        )
-
-        st.write(
-            "**Status:**",
-            (
-                "REVOKED"
-                if certificate.serial_number
-                in st.session_state.revoked
-                else "ACTIVE"
-            )
-        )
-
-        st.divider()
-
-        st.subheader(
-            "Live PKI Lifecycle"
+            "Certificate Lifecycle"
         )
 
         st.code(
             """
         KEY GENERATION
-              │
-              ▼
+              |
+              v
         CERTIFICATE ISSUANCE
-              │
-              ▼
+              |
+              v
             ACTIVE
-              │
-              ├───────────────┐
-              │               │
-              ▼               ▼
-          EXPIRED          REVOKED
-              │               │
-              └───────┬───────┘
-                      ▼
-                  UNTRUSTED
+              |
+       +------+------+
+       |             |
+       v             v
+    EXPIRED       REVOKED
+       |             |
+       +------+------+
+              |
+              v
+          UNTRUSTED
             """
         )
 
@@ -1279,44 +1183,39 @@ with tabs[4]:
 # SECURE COMMUNICATION
 # ============================================================
 
-with tabs[5]:
+with secure:
 
     st.header(
         "🔒 Secure Communication Simulator"
     )
 
-    st.markdown(
-        """
-        This demonstration combines certificate authentication,
-        digital signatures and message integrity.
-        """
-    )
-
     if not st.session_state.certificates:
 
         st.warning(
-            "Create a certificate before running the simulation."
+            "Create a certificate first."
         )
 
     else:
 
-        selected = st.selectbox(
-            "Select Sender",
-            list(
-                st.session_state.certificates.keys()
-            ),
-            key="sender"
+        names = list(
+            st.session_state.certificates.keys()
+        )
+
+        sender = st.selectbox(
+            "Sender Certificate",
+            names,
+            key="secure_sender"
         )
 
         item = (
             st.session_state.certificates[
-                selected
+                sender
             ]
         )
 
-        secure_message = st.text_area(
+        message = st.text_area(
             "Secure Message",
-            value="Transfer request: ₹5000"
+            "Transfer request: Rs. 5000"
         )
 
         if st.button(
@@ -1324,41 +1223,39 @@ with tabs[5]:
             type="primary"
         ):
 
-            certificate = item["cert"]
+            cert = item["cert"]
 
-            certificate_ok = False
+            checks = check_certificate(
+                cert,
+                st.session_state.intermediate_cert,
+                st.session_state.revoked
+            )
 
-            if (
-                st.session_state.intermediate_cert
-            ):
-
-                checks = certificate_status(
-                    certificate,
-                    st.session_state.intermediate_cert,
-                    st.session_state.revoked
-                )
-
-                certificate_ok = (
-                    checks["Trusted"]
-                )
+            certificate_ok = (
+                checks["Trusted"]
+            )
 
             signature = sign_data(
                 item["key"],
-                secure_message.encode()
+                message.encode("utf-8")
             )
 
             signature_ok = verify_data(
                 item["key"].public_key(),
-                secure_message.encode(),
+                message.encode("utf-8"),
                 signature
             )
+
+            message_hash = hashlib.sha256(
+                message.encode("utf-8")
+            ).hexdigest()
 
             st.subheader(
                 "Security Pipeline"
             )
 
             st.write(
-                "1️⃣ Sender Certificate"
+                "1️⃣ Certificate Authentication"
             )
 
             if certificate_ok:
@@ -1370,7 +1267,7 @@ with tabs[5]:
             else:
 
                 st.error(
-                    "✗ Certificate not trusted"
+                    "✗ Certificate rejected"
                 )
 
             st.write(
@@ -1392,10 +1289,6 @@ with tabs[5]:
             st.write(
                 "3️⃣ Message Integrity"
             )
-
-            message_hash = hashlib.sha256(
-                secure_message.encode()
-            ).hexdigest()
 
             st.code(
                 message_hash
@@ -1419,32 +1312,29 @@ with tabs[5]:
             st.divider()
 
             st.subheader(
-                "What happened?"
+                "Communication Flow"
             )
 
-            st.markdown(
+            st.code(
                 """
-                ```text
-                Sender
-                   │
-                   ├── X.509 Certificate
-                   │
-                   ▼
-                Certificate Validation
-                   │
-                   ├── Issuer
-                   ├── Signature
-                   ├── Validity
-                   └── Revocation
-                   │
-                   ▼
-                Digital Signature
-                   │
-                   ▼
-                Message Integrity
-                   │
-                   ▼
-                Receiver
-                ```
+                 SENDER
+                    |
+                    | X.509 Certificate
+                    v
+             Certificate Check
+                    |
+             +------+------+
+             |             |
+             v             v
+          Trusted       Rejected
+             |
+             v
+       Digital Signature
+             |
+             v
+       Message Integrity
+             |
+             v
+           RECEIVER
                 """
             )
